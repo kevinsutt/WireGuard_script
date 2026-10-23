@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+
+
+import base64
+import datetime
+import json
+import logging
+from pathlib import Path
+import ipaddress
+import argparse
+
+from cryptography.hazmat.primitives.asymmetric import x25519
+from cryptography.hazmat.primitives import serialization
+
+WG_PORT = 51820
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+
+
+# -------------------- Key Generation --------------------
+
+def generate_key_pair() -> tuple[str, str]:
+    private_key = x25519.X25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
+    public_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+    return (
+        base64.b64encode(private_bytes).decode(),
+        base64.b64encode(public_bytes).decode(),
+    )
+
+
+# -------------------- Validation --------------------
+
+def validate_allowed_ips(value: str) -> str:
+    parts = [p.strip() for p in value.split(',')]
+
+    if not parts:
+        raise argparse.ArgumentTypeError("AllowedIPs cannot be empty")
+
+    for part in parts:
+        try:
+            ipaddress.IPv4Network(part, strict=False)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"Invalid CIDR: {part}")
+
+    return ", ".join(parts)  # normalize formatting
+
+
+def validate_ip(ip: str) -> str:
+    try:
+        ipaddress.IPv4Address(ip)
+        return ip
+    except ValueError:
+        raise argparse.ArgumentTypeError("Invalid IP address")
+
+
+def parse_ip_range(ip_range_str: str) -> list[ipaddress.IPv4Address]:
+    try:
+        if '-' in ip_range_str:
+            start, end = ip_range_str.split('-')
+            start_ip = ipaddress.IPv4Address(start)
+            end_ip = ipaddress.IPv4Address(end)
+            if start_ip > end_ip:
+                raise ValueError
+            return [ipaddress.IPv4Address(i) for i in range(int(start_ip), int(end_ip) + 1)]
+        elif '/' in ip_range_str:
+            network = ipaddress.IPv4Network(ip_range_str, strict=False)
+            return list(network.hosts())
+        else:
+            return [ipaddress.IPv4Address(ip_range_str)]
+    except ValueError:
+        raise argparse.ArgumentTypeError("Invalid IP range format")
+
+
+# -------------------- Peer Handling --------------------
+
+def load_peer_keys(path: Path) -> list[dict]:
+    if not path.exists():
+        raise FileNotFoundError(f"Peer database not found: {path}")
+
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        raise ValueError("Invalid JSON in peer database")
+
+    keys = data.get("peer_public_keys")
+    if not isinstance(keys, list) or not keys:
+        raise ValueError("peer_public_keys must be a non-empty list")
+
+    return keys
+
+
+def get_peer_key(peer_entries: list[dict], name: str) -> str:
+    for entry in peer_entries:
+        if entry.get("name") == name:
+            return entry.get("key")
+
+    raise ValueError(f"Peer '{name}' not found in database")
+
+
+# -------------------- Config Generation --------------------
+
+def generate_configs(
+    config_name: str,
+    ip_list: list[ipaddress.IPv4Address],
+    allowed_ips: str,
+    endpoint_ip: str,
+    peer_public_key: str,
+    output_dir: Path,
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for ip in ip_list:
+        private_key_b64, public_key_b64 = generate_key_pair()
+
+        last_octet = str(ip).split('.')[-1]
+        name = f"{config_name}{last_octet}"
+
+        config_text = f"""[Interface]
+PrivateKey = {private_key_b64}
+Address = {ip}/26
+
+[Peer]
+PublicKey = {peer_public_key}
+AllowedIPs = {allowed_ips}
+Endpoint = {endpoint_ip}:{WG_PORT}
+"""
+
+        conf_path = output_dir / f"{name}.conf"
+        pub_path = output_dir / f"{name}.pub"
+
+        conf_path.write_text(config_text)
+        pub_path.write_text(public_key_b64)
+
+        try:
+            conf_path.chmod(0o600)
+            pub_path.chmod(0o600)
+        except Exception:
+            pass
+
+    logging.info(f"Generated {len(ip_list)} configuration(s) in {output_dir}")
+
+# -------------------- CLI --------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="WireGuard config generator")
+
+    parser.add_argument("--name", required=True, help="Configuration base name")
+    parser.add_argument("--ip-range", required=True, help="IP or range (e.g. 10.0.0.1-10.0.0.10 or 10.0.0.0/28)")
+    parser.add_argument("--allowed-ips", required=True, type=validate_allowed_ips, help="Comma-separated CIDRs")
+    parser.add_argument("--endpoint", required=True, type=validate_ip, help="Endpoint IP")
+    parser.add_argument("--peer-name", required=True, help="Peer name from database")
+    parser.add_argument("--peer-db", default="peer_database.json", help="Path to peer database JSON")
+    parser.add_argument("--output", default=str(Path.home() / "Desktop" / "WG config"), help="Output directory")
+
+    return parser
+
+
+# -------------------- Main --------------------
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        ip_list = parse_ip_range(args.ip_range)
+        peer_entries = load_peer_keys(Path(args.peer_db))
+        peer_public_key = get_peer_key(peer_entries, args.peer_name)
+
+        now = datetime.datetime.now().strftime("%Y%m%d%H%M")
+        folder_name = f"{now}_{args.name}"
+        output_dir = Path(args.output) / folder_name
+
+        generate_configs(
+            config_name=args.name,
+            ip_list=ip_list,
+            allowed_ips=args.allowed_ips,
+            endpoint_ip=args.endpoint,
+            peer_public_key=peer_public_key,
+            output_dir=output_dir,
+        )
+
+    except Exception as e:
+        logging.error(e)
+        exit(1)
+
+
+if __name__ == "__main__":
+    main()
